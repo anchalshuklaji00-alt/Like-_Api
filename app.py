@@ -24,7 +24,7 @@ app = Flask(__name__)
 # ============================================================
 # CONFIG
 # ============================================================
-RELEASE_VERSION = "OB53"  # ✅ Updated from OB52
+RELEASE_VERSION = "OB53"
 USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 13; CPH2095 Build/RKQ1.211119.001)"
 MAIN_KEY = base64.b64decode('WWcmdGMlREV1aDYlWmNeOA==')
 MAIN_IV  = base64.b64decode('Nm95WkRyMjJFM3ljaGpNJQ==')
@@ -49,22 +49,24 @@ def fetch_access_token_sync(cred_str):
     return data.get("access_token", ""), data.get("open_id", "")
 
 
-def update_tokens(limit=10):
-    """uidpass.json se naye OB53 tokens generate karo"""
+def update_tokens():
+    """uidpass.json ke PURE accounts se tokens generate karo — NO LIMIT"""
     global MEMORY_TOKENS, TOKEN_LAST_UPDATED
     try:
         with open("uidpass.json", "r") as f:
             accounts = json.load(f)
 
         new_tokens = []
-        app.logger.info(f"[TOKEN] Generating {limit} new tokens (OB53)...")
+        failed = 0
+        app.logger.info(f"[TOKEN] Total accounts: {len(accounts)} — generating tokens (OB53)...")
 
-        for acc in accounts[:limit]:
+        for acc in accounts:  # ✅ No limit — sab accounts try honge
             try:
                 cred_str = f"uid={acc['uid']}&password={acc['password']}"
                 access_token, open_id = fetch_access_token_sync(cred_str)
                 if not access_token:
                     app.logger.warning(f"[TOKEN] No access_token for {acc.get('uid')}")
+                    failed += 1
                     continue
 
                 login_req = FreeFire_pb2.LoginReq()
@@ -93,6 +95,7 @@ def update_tokens(limit=10):
 
                 if resp.status_code != 200:
                     app.logger.error(f"[TOKEN] MajorLogin {resp.status_code} for {acc.get('uid')}: {resp.content[:80]}")
+                    failed += 1
                     continue
 
                 login_res = FreeFire_pb2.LoginRes()
@@ -102,12 +105,16 @@ def update_tokens(limit=10):
 
                 if token:
                     new_tokens.append({"token": token})
-                    app.logger.info(f"[TOKEN] OK for uid {acc.get('uid')}")
+                    app.logger.info(f"[TOKEN] ✅ uid {acc.get('uid')}")
                 else:
                     app.logger.warning(f"[TOKEN] Empty token for {acc.get('uid')}")
+                    failed += 1
 
             except Exception as e:
                 app.logger.error(f"[TOKEN] Error for {acc.get('uid')}: {e}")
+                failed += 1
+
+        app.logger.info(f"[TOKEN] Done — Success: {len(new_tokens)}, Failed: {failed}")
 
         if new_tokens:
             MEMORY_TOKENS = new_tokens
@@ -115,17 +122,17 @@ def update_tokens(limit=10):
             try:
                 with open("tokens.json", "w") as f:
                     json.dump(new_tokens, f, indent=4)
-                app.logger.info(f"[TOKEN] {len(new_tokens)} tokens saved.")
+                app.logger.info(f"[TOKEN] {len(new_tokens)} tokens saved to tokens.json")
             except Exception as e:
                 app.logger.warning(f"[TOKEN] File save failed (RAM me saved): {e}")
         else:
             app.logger.error("[TOKEN] Koi token generate nahi hua!")
 
-        return len(new_tokens)
+        return len(new_tokens), failed
 
     except Exception as e:
         app.logger.error(f"[TOKEN] update_tokens error: {e}")
-        return 0
+        return 0, 0
 
 
 def load_tokens():
@@ -155,12 +162,12 @@ def get_tokens_with_auto_refresh():
 
     if not tokens:
         app.logger.info("[TOKEN] Tokens khali — auto generating...")
-        update_tokens(10)
+        update_tokens()  # ✅ No limit
         tokens = load_tokens()
 
     elif TOKEN_LAST_UPDATED and (time.time() - TOKEN_LAST_UPDATED) > 25200:
         app.logger.info("[TOKEN] 7 ghante purane — auto refreshing...")
-        update_tokens(10)
+        update_tokens()  # ✅ No limit
         tokens = load_tokens()
 
     return tokens
@@ -301,11 +308,17 @@ def make_request(encrypt, server_name, token):
 def index():
     token_count = len(load_tokens())
     age_hrs = round((time.time() - TOKEN_LAST_UPDATED) / 3600, 1) if TOKEN_LAST_UPDATED else "N/A"
+    try:
+        with open("uidpass.json", "r") as f:
+            total_accounts = len(json.load(f))
+    except:
+        total_accounts = "N/A"
     return jsonify({
         "Developer": "Rolex",
         "status": "Online",
         "version": RELEASE_VERSION,
         "tokens_loaded": token_count,
+        "total_accounts": total_accounts,
         "token_age_hours": age_hrs,
         "like_endpoint": "/like?uid=<uid>&server_name=IND",
         "refresh_endpoint": "/cron"
@@ -314,10 +327,12 @@ def index():
 
 @app.route('/cron', methods=['GET'])
 def trigger_cron():
-    """Manual ya scheduled cron se token refresh"""
-    count = update_tokens(10)
+    """Manual ya scheduled cron se token refresh — PURE uidpass.json accounts"""
+    count, failed = update_tokens()  # ✅ No limit — sab accounts
     return jsonify({
-        "message": f"Token refresh done. Generated: {count}",
+        "message": f"Token refresh done. Generated: {count}, Failed: {failed}",
+        "tokens_generated": count,
+        "tokens_failed": failed,
         "version": RELEASE_VERSION,
         "status": 200 if count > 0 else 500
     })
@@ -348,7 +363,7 @@ def handle_requests():
         # ⚡ Token expire hua → force refresh + retry
         if before is None:
             app.logger.warning("[LIKE] Token expired — force refresh kar raha hoon...")
-            update_tokens(10)
+            update_tokens()  # ✅ No limit
             tokens = load_tokens()
             if not tokens:
                 return jsonify({"error": "Force refresh ke baad bhi token nahi mila."}), 500
@@ -402,3 +417,4 @@ def handle_requests():
 
 if __name__ == '__main__':
     app.run(debug=True, use_reloader=False)
+
