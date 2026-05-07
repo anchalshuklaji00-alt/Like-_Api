@@ -496,6 +496,297 @@ def trigger_cron_har():
     return jsonify(data), code
 
 
+# ─── SAVE UID+PASS ROUTE ───
+
+@app.route('/save', methods=['GET'])
+def save_account():
+    """
+    Server ki uidpass file me naya account add karo.
+    URL: /save?uid=12345&password=xxxxx&server=IND
+    """
+    uid_val  = request.args.get("uid", "").strip()
+    pass_val = request.args.get("password", "").strip()
+    server   = request.args.get("server", "").upper().strip()
+
+    # ── Validation ──
+    if not uid_val:
+        return jsonify({"error": "❌ 'uid' parameter missing hai."}), 400
+    if not pass_val:
+        return jsonify({"error": "❌ 'password' parameter missing hai."}), 400
+    if not server:
+        return jsonify({"error": "❌ 'server' parameter missing hai. Example: server=IND"}), 400
+    if server not in SERVER_CONFIG:
+        return jsonify({
+            "error":   f"❌ Unknown server '{server}'.",
+            "valid_servers": list(SERVER_CONFIG.keys())
+        }), 400
+
+    uidpass_file = SERVER_CONFIG[server]["uidpass_file"]
+
+    # ── File load karo (ya naya banao) ──
+    try:
+        with open(uidpass_file, "r") as f:
+            accounts = json.load(f)
+        if not isinstance(accounts, list):
+            accounts = []
+    except FileNotFoundError:
+        accounts = []   # file nahi thi — naya banayenge
+    except Exception as e:
+        return jsonify({"error": f"❌ File read error: {e}"}), 500
+
+    # ── Duplicate check ──
+    for acc in accounts:
+        if str(acc.get("uid", "")) == str(uid_val):
+            return jsonify({
+                "status":  "already_exists",
+                "message": f"⚠️ UID {uid_val} pehle se '{uidpass_file}' me hai.",
+                "server":  server,
+                "uid":     uid_val
+            }), 200
+
+    # ── Append + Save ──
+    accounts.append({"uid": uid_val, "password": pass_val})
+    try:
+        with open(uidpass_file, "w") as f:
+            json.dump(accounts, f, indent=4)
+    except Exception as e:
+        return jsonify({"error": f"❌ File save error: {e}"}), 500
+
+    app.logger.info(f"[SAVE][{server}] ✅ uid={uid_val} → {uidpass_file}")
+
+    return jsonify({
+        "status":        "saved",
+        "message":       f"✅ UID {uid_val} successfully '{uidpass_file}' me save ho gaya.",
+        "server":        server,
+        "uid":           uid_val,
+        "total_accounts": len(accounts),
+        "note":          f"Token generate karne ke liye /cron/{server.lower()} chalao."
+    }), 200
+
+
+# ─── DELETE UID ROUTE ───
+
+@app.route('/delete', methods=['GET'])
+def delete_account():
+    """
+    Server ki uidpass file se koi UID remove karo.
+    URL: /delete?uid=12345&server=IND
+    """
+    uid_val = request.args.get("uid", "").strip()
+    server  = request.args.get("server", "").upper().strip()
+
+    if not uid_val:
+        return jsonify({"error": "❌ 'uid' parameter missing hai."}), 400
+    if not server:
+        return jsonify({"error": "❌ 'server' parameter missing hai."}), 400
+    if server not in SERVER_CONFIG:
+        return jsonify({
+            "error":         f"❌ Unknown server '{server}'.",
+            "valid_servers": list(SERVER_CONFIG.keys())
+        }), 400
+
+    uidpass_file = SERVER_CONFIG[server]["uidpass_file"]
+
+    try:
+        with open(uidpass_file, "r") as f:
+            accounts = json.load(f)
+        if not isinstance(accounts, list):
+            accounts = []
+    except FileNotFoundError:
+        return jsonify({"error": f"❌ File '{uidpass_file}' exist nahi karta."}), 404
+    except Exception as e:
+        return jsonify({"error": f"❌ File read error: {e}"}), 500
+
+    before_count = len(accounts)
+    accounts = [a for a in accounts if str(a.get("uid", "")) != str(uid_val)]
+    after_count  = len(accounts)
+
+    if before_count == after_count:
+        return jsonify({
+            "status":  "not_found",
+            "message": f"⚠️ UID {uid_val} '{uidpass_file}' me nahi mila.",
+            "server":  server,
+            "uid":     uid_val
+        }), 404
+
+    try:
+        with open(uidpass_file, "w") as f:
+            json.dump(accounts, f, indent=4)
+    except Exception as e:
+        return jsonify({"error": f"❌ File save error: {e}"}), 500
+
+    app.logger.info(f"[DELETE][{server}] 🗑️ uid={uid_val} removed from {uidpass_file}")
+
+    return jsonify({
+        "status":         "deleted",
+        "message":        f"🗑️ UID {uid_val} '{uidpass_file}' se remove ho gaya.",
+        "server":         server,
+        "uid":            uid_val,
+        "total_accounts": after_count
+    }), 200
+
+
+# ─── LIST ACCOUNTS ROUTE ───
+
+@app.route('/accounts', methods=['GET'])
+def list_accounts():
+    """
+    Kisi server ke saved accounts dekho.
+    URL: /accounts?server=IND
+    """
+    server = request.args.get("server", "").upper().strip()
+
+    if not server:
+        # Sare servers ka summary
+        summary = {}
+        for srv, cfg in SERVER_CONFIG.items():
+            try:
+                with open(cfg["uidpass_file"], "r") as f:
+                    accs = json.load(f)
+                summary[srv] = {
+                    "total":    len(accs),
+                    "file":     cfg["uidpass_file"],
+                    "accounts": [{"uid": a.get("uid"), "password": a.get("password")} for a in accs]
+                }
+            except FileNotFoundError:
+                summary[srv] = {"total": 0, "file": cfg["uidpass_file"], "accounts": []}
+            except Exception as e:
+                summary[srv] = {"error": str(e)}
+        return jsonify({"all_servers": summary}), 200
+
+    if server not in SERVER_CONFIG:
+        return jsonify({
+            "error":         f"❌ Unknown server '{server}'.",
+            "valid_servers": list(SERVER_CONFIG.keys())
+        }), 400
+
+    uidpass_file = SERVER_CONFIG[server]["uidpass_file"]
+    try:
+        with open(uidpass_file, "r") as f:
+            accounts = json.load(f)
+        if not isinstance(accounts, list):
+            accounts = []
+    except FileNotFoundError:
+        accounts = []
+    except Exception as e:
+        return jsonify({"error": f"❌ File read error: {e}"}), 500
+
+    return jsonify({
+        "server":   server,
+        "file":     uidpass_file,
+        "total":    len(accounts),
+        "accounts": [{"uid": a.get("uid"), "password": a.get("password")} for a in accounts]
+    }), 200
+
+
+# ─── SERVER STATUS ROUTE ───
+
+@app.route('/status', methods=['GET'])
+def server_status():
+    """
+    Har server me kitne IDs aur kitne Tokens hain — full details ke saath.
+    URL: /status          → sare servers ka status
+    URL: /status?server=IND → sirf ek server ka status
+    """
+    server_param = request.args.get("server", "").upper().strip()
+
+    def get_server_detail(srv):
+        cfg = SERVER_CONFIG[srv]
+
+        # ── IDs count from uidpass file ──
+        try:
+            with open(cfg["uidpass_file"], "r") as f:
+                accounts = json.load(f)
+            if not isinstance(accounts, list):
+                accounts = []
+            uid_list = [{"uid": a.get("uid"), "password": a.get("password")} for a in accounts]
+            total_ids = len(accounts)
+            ids_status = "✅ OK"
+        except FileNotFoundError:
+            uid_list   = []
+            total_ids  = 0
+            ids_status = "⚠️ File not found"
+        except Exception as e:
+            uid_list   = []
+            total_ids  = 0
+            ids_status = f"❌ Error: {e}"
+
+        # ── Tokens count from memory / token file ──
+        mem_tokens = MEMORY_TOKENS.get(srv, [])
+        if mem_tokens:
+            token_source = "memory (RAM)"
+            tokens_list  = mem_tokens
+        else:
+            try:
+                with open(cfg["token_file"], "r") as f:
+                    tokens_list = json.load(f)
+                if not isinstance(tokens_list, list):
+                    tokens_list = []
+                token_source = f"file ({cfg['token_file']})"
+            except FileNotFoundError:
+                tokens_list  = []
+                token_source = "⚠️ Token file not found"
+            except Exception as e:
+                tokens_list  = []
+                token_source = f"❌ Error: {e}"
+
+        total_tokens = len(tokens_list)
+
+        # ── Token age ──
+        last_updated = TOKEN_LAST_UPDATED.get(srv, 0)
+        if last_updated:
+            age_seconds = round(time.time() - last_updated)
+            age_hours   = round(age_seconds / 3600, 2)
+            token_age   = f"{age_hours} hours ago"
+        else:
+            token_age = "Never refreshed / unknown"
+
+        return {
+            "server":        srv,
+            "uidpass_file":  cfg["uidpass_file"],
+            "token_file":    cfg["token_file"],
+            "total_ids":     total_ids,
+            "ids_status":    ids_status,
+            "uid_list":      uid_list,
+            "total_tokens":  total_tokens,
+            "token_source":  token_source,
+            "token_age":     token_age,
+            "like_url":      cfg["like_url"],
+            "info_url":      cfg["info_url"],
+            "refresh_url":   f"/cron/{srv.lower()}",
+            "summary":       f"📋 IDs: {total_ids} | 🔑 Tokens: {total_tokens}"
+        }
+
+    # ── Single server ──
+    if server_param:
+        if server_param not in SERVER_CONFIG:
+            return jsonify({
+                "error":         f"❌ Unknown server '{server_param}'.",
+                "valid_servers": list(SERVER_CONFIG.keys())
+            }), 400
+        detail = get_server_detail(server_param)
+        return jsonify(detail), 200
+
+    # ── All servers ──
+    all_status   = {}
+    total_ids_all    = 0
+    total_tokens_all = 0
+
+    for srv in SERVER_CONFIG:
+        detail = get_server_detail(srv)
+        all_status[srv]   = detail
+        total_ids_all    += detail["total_ids"]
+        total_tokens_all += detail["total_tokens"]
+
+    return jsonify({
+        "Developer":       "Rolex ❤️‍🔥",
+        "overall_summary": f"📋 Total IDs (all servers): {total_ids_all} | 🔑 Total Tokens (all servers): {total_tokens_all}",
+        "total_ids_all_servers":    total_ids_all,
+        "total_tokens_all_servers": total_tokens_all,
+        "servers": all_status
+    }), 200
+
+
 # ─── LIKE ROUTE ───
 
 @app.route('/like', methods=['GET'])
@@ -598,4 +889,3 @@ def handle_requests():
 
 if __name__ == '__main__':
     app.run(debug=True, use_reloader=False)
-
