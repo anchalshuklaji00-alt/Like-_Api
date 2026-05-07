@@ -47,7 +47,7 @@ https://your-domain.com/like?uid=123456789
 ### Example Response:
 ```json
 {
-  "credit": "https://t.me/paglu_dev",
+  "credit": "https://t.me/Rolex",
   "LikesGivenByAPI": 100,
   "LikesafterCommand": 200,
   "LikesbeforeCommand": 100,
