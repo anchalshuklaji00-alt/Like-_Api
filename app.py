@@ -13,8 +13,6 @@ import uid_generator_pb2
 from google.protobuf.message import DecodeError
 import base64
 import time
-from proto import FreeFire_pb2
-from google.protobuf import json_format
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
 warnings.filterwarnings("ignore", category=InsecureRequestWarning)
@@ -24,10 +22,8 @@ app = Flask(__name__)
 # ============================================================
 # CONFIG
 # ============================================================
-RELEASE_VERSION = "OB53"
+RELEASE_VERSION = "OB54"
 USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 13; CPH2095 Build/RKQ1.211119.001)"
-MAIN_KEY = base64.b64decode('WWcmdGMlREV1aDYlWmNeOA==')
-MAIN_IV  = base64.b64decode('Nm95WkRyMjJFM3ljaGpNJQ==')
 
 # ============================================================
 # SERVER CONFIG — har server ka alag uidpass + token file
@@ -93,22 +89,17 @@ TOKEN_LAST_UPDATED = {s: 0 for s in SERVER_CONFIG}
 # TOKEN GENERATOR — per server
 # ============================================================
 
-def fetch_access_token_sync(cred_str):
-    url = "https://ffmconnect.live.gop.garenanow.com/oauth/guest/token/grant"
-    payload = (
-        cred_str
-        + "&response_type=token"
-        + "&client_type=2"
-        + "&client_secret=2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3"
-        + "&client_id=100067"
-    )
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Content-Type": "application/x-www-form-urlencoded"
-    }
-    resp = requests.post(url, data=payload, headers=headers, verify=False, timeout=15)
-    data = resp.json()
-    return data.get("access_token", ""), data.get("open_id", "")
+def fetch_access_token_sync(uid, password):
+    url = f"https://ff-ob54-jwt-api.vercel.app/guest_to_jwt?uid={uid}&password={password}"
+    try:
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        token = data.get("jwt_token") or data.get("access_token")
+        return token
+    except Exception as e:
+        app.logger.error(f"[TOKEN] JWT fetch error for uid={uid}: {e}")
+        return None
 
 
 def update_tokens(server: str):
@@ -148,54 +139,13 @@ def update_tokens(server: str):
         uid_val  = acc.get("uid", "?")
         pass_val = acc.get("password", "?")
         try:
-            cred_str = f"uid={uid_val}&password={pass_val}"
-            access_token, open_id = fetch_access_token_sync(cred_str)
-
-            if not access_token:
-                app.logger.warning(f"[TOKEN][{server}] ❌ No access_token → uid={uid_val}")
-                failed_accs.append({"uid": uid_val, "password": pass_val, "reason": "No access_token"})
-                continue
-
-            login_req = FreeFire_pb2.LoginReq()
-            json_format.ParseDict({
-                "open_id":            open_id,
-                "open_id_type":       "4",
-                "login_token":        access_token,
-                "orign_platform_type": "4"
-            }, login_req)
-            proto_bytes = login_req.SerializeToString()
-
-            cipher  = AES.new(MAIN_KEY, AES.MODE_CBC, MAIN_IV)
-            pad_len = AES.block_size - (len(proto_bytes) % AES.block_size)
-            padded  = proto_bytes + bytes([pad_len] * pad_len)
-            encrypted = cipher.encrypt(padded)
-
-            url_login = "https://loginbp.ggblueshark.com/MajorLogin"
-            headers   = {
-                "User-Agent":      USER_AGENT,
-                "Content-Type":    "application/octet-stream",
-                "X-Unity-Version": "2018.4.11f1",
-                "X-GA":            "v1 1",
-                "ReleaseVersion":  RELEASE_VERSION
-            }
-            resp = requests.post(url_login, data=encrypted, headers=headers, verify=False, timeout=15)
-
-            if resp.status_code != 200:
-                reason = f"MajorLogin HTTP {resp.status_code}"
-                app.logger.error(f"[TOKEN][{server}] ❌ {reason} → uid={uid_val}")
-                failed_accs.append({"uid": uid_val, "password": pass_val, "reason": reason})
-                continue
-
-            login_res = FreeFire_pb2.LoginRes()
-            login_res.ParseFromString(resp.content)
-            msg   = json.loads(json_format.MessageToJson(login_res))
-            token = msg.get("token")
+            token = fetch_access_token_sync(uid_val, pass_val)
 
             if token:
                 new_tokens.append({"token": token})
                 app.logger.info(f"[TOKEN][{server}] ✅ uid={uid_val}")
             else:
-                reason = "Empty token from MajorLogin"
+                reason = "No token from JWT API"
                 app.logger.warning(f"[TOKEN][{server}] ❌ {reason} → uid={uid_val}")
                 failed_accs.append({"uid": uid_val, "password": pass_val, "reason": reason})
 
@@ -643,249 +593,4 @@ def list_accounts():
             try:
                 with open(cfg["uidpass_file"], "r") as f:
                     accs = json.load(f)
-                summary[srv] = {
-                    "total":    len(accs),
-                    "file":     cfg["uidpass_file"],
-                    "accounts": [{"uid": a.get("uid"), "password": a.get("password")} for a in accs]
-                }
-            except FileNotFoundError:
-                summary[srv] = {"total": 0, "file": cfg["uidpass_file"], "accounts": []}
-            except Exception as e:
-                summary[srv] = {"error": str(e)}
-        return jsonify({"all_servers": summary}), 200
-
-    if server not in SERVER_CONFIG:
-        return jsonify({
-            "error":         f"❌ Unknown server '{server}'.",
-            "valid_servers": list(SERVER_CONFIG.keys())
-        }), 400
-
-    uidpass_file = SERVER_CONFIG[server]["uidpass_file"]
-    try:
-        with open(uidpass_file, "r") as f:
-            accounts = json.load(f)
-        if not isinstance(accounts, list):
-            accounts = []
-    except FileNotFoundError:
-        accounts = []
-    except Exception as e:
-        return jsonify({"error": f"❌ File read error: {e}"}), 500
-
-    return jsonify({
-        "server":   server,
-        "file":     uidpass_file,
-        "total":    len(accounts),
-        "accounts": [{"uid": a.get("uid"), "password": a.get("password")} for a in accounts]
-    }), 200
-
-
-# ─── SERVER STATUS ROUTE ───
-
-@app.route('/status', methods=['GET'])
-def server_status():
-    """
-    Har server me kitne IDs aur kitne Tokens hain — full details ke saath.
-    URL: /status          → sare servers ka status
-    URL: /status?server=IND → sirf ek server ka status
-    """
-    server_param = request.args.get("server", "").upper().strip()
-
-    def get_server_detail(srv):
-        cfg = SERVER_CONFIG[srv]
-
-        # ── IDs count from uidpass file ──
-        try:
-            with open(cfg["uidpass_file"], "r") as f:
-                accounts = json.load(f)
-            if not isinstance(accounts, list):
-                accounts = []
-            uid_list = [{"uid": a.get("uid"), "password": a.get("password")} for a in accounts]
-            total_ids = len(accounts)
-            ids_status = "✅ OK"
-        except FileNotFoundError:
-            uid_list   = []
-            total_ids  = 0
-            ids_status = "⚠️ File not found"
-        except Exception as e:
-            uid_list   = []
-            total_ids  = 0
-            ids_status = f"❌ Error: {e}"
-
-        # ── Tokens count from memory / token file ──
-        mem_tokens = MEMORY_TOKENS.get(srv, [])
-        if mem_tokens:
-            token_source = "memory (RAM)"
-            tokens_list  = mem_tokens
-        else:
-            try:
-                with open(cfg["token_file"], "r") as f:
-                    tokens_list = json.load(f)
-                if not isinstance(tokens_list, list):
-                    tokens_list = []
-                token_source = f"file ({cfg['token_file']})"
-            except FileNotFoundError:
-                tokens_list  = []
-                token_source = "⚠️ Token file not found"
-            except Exception as e:
-                tokens_list  = []
-                token_source = f"❌ Error: {e}"
-
-        total_tokens = len(tokens_list)
-
-        # ── Token age ──
-        last_updated = TOKEN_LAST_UPDATED.get(srv, 0)
-        if last_updated:
-            age_seconds = round(time.time() - last_updated)
-            age_hours   = round(age_seconds / 3600, 2)
-            token_age   = f"{age_hours} hours ago"
-        else:
-            token_age = "Never refreshed / unknown"
-
-        return {
-            "server":        srv,
-            "uidpass_file":  cfg["uidpass_file"],
-            "token_file":    cfg["token_file"],
-            "total_ids":     total_ids,
-            "ids_status":    ids_status,
-            "uid_list":      uid_list,
-            "total_tokens":  total_tokens,
-            "token_source":  token_source,
-            "token_age":     token_age,
-            "like_url":      cfg["like_url"],
-            "info_url":      cfg["info_url"],
-            "refresh_url":   f"/cron/{srv.lower()}",
-            "summary":       f"📋 IDs: {total_ids} | 🔑 Tokens: {total_tokens}"
-        }
-
-    # ── Single server ──
-    if server_param:
-        if server_param not in SERVER_CONFIG:
-            return jsonify({
-                "error":         f"❌ Unknown server '{server_param}'.",
-                "valid_servers": list(SERVER_CONFIG.keys())
-            }), 400
-        detail = get_server_detail(server_param)
-        return jsonify(detail), 200
-
-    # ── All servers ──
-    all_status   = {}
-    total_ids_all    = 0
-    total_tokens_all = 0
-
-    for srv in SERVER_CONFIG:
-        detail = get_server_detail(srv)
-        all_status[srv]   = detail
-        total_ids_all    += detail["total_ids"]
-        total_tokens_all += detail["total_tokens"]
-
-    return jsonify({
-        "Developer":       "Rolex ❤️‍🔥",
-        "overall_summary": f"📋 Total IDs (all servers): {total_ids_all} | 🔑 Total Tokens (all servers): {total_tokens_all}",
-        "total_ids_all_servers":    total_ids_all,
-        "total_tokens_all_servers": total_tokens_all,
-        "servers": all_status
-    }), 200
-
-
-# ─── LIKE ROUTE ───
-
-@app.route('/like', methods=['GET'])
-def handle_requests():
-    uid = request.args.get("uid")
-    if not uid:
-        return jsonify({"error": "UID required"}), 400
-
-    server_name = request.args.get("server_name", "IND").upper()
-
-    # Server valid hai?
-    if server_name not in SERVER_CONFIG:
-        return jsonify({
-            "error": f"Unknown server '{server_name}'. Valid: {list(SERVER_CONFIG.keys())}"
-        }), 400
-
-    cfg = SERVER_CONFIG[server_name]
-
-    try:
-        # Step 1: Server ke tokens lo
-        tokens = get_tokens_with_auto_refresh(server_name)
-
-        if not tokens:
-            # Token file exist nahi ya khali — server ke liye like nahi ja sakta
-            return jsonify({
-                "error":   f"❌ {server_name} server me like nahi ja sakta.",
-                "reason":  f"'{cfg['token_file']}' me koi token nahi hai.",
-                "fix":     f"Pehle /cron/{server_name.lower()} run karo tokens generate karne ke liye.",
-                "server":  server_name,
-                "status":  0
-            }), 503
-
-        encrypted_uid = enc(uid)
-        if not encrypted_uid:
-            return jsonify({"error": "Encryption failed."}), 500
-
-        # Step 2: Before likes fetch
-        token = tokens[0]['token']
-        before = make_request(encrypted_uid, server_name, token)
-
-        # Token expire hua → force refresh + retry
-        if before is None:
-            app.logger.warning(f"[LIKE][{server_name}] Token expired — force refresh...")
-            update_tokens(server_name)
-            tokens = load_tokens(server_name)
-            if not tokens:
-                return jsonify({
-                    "error":  f"❌ {server_name} server me like nahi ja sakta.",
-                    "reason": "Force refresh ke baad bhi token nahi mila.",
-                    "server": server_name,
-                    "status": 0
-                }), 503
-            token  = tokens[0]['token']
-            before = make_request(encrypted_uid, server_name, token)
-
-        if before is None:
-            return jsonify({
-                "error":  "Player info nahi mila. UID / server_name check karo.",
-                "server": server_name
-            }), 500
-
-        data_before = json.loads(MessageToJson(before))
-        before_like = int(data_before.get('AccountInfo', {}).get('Likes', 0) or 0)
-
-        # Step 3: Likes bhejo — server ka like_url use karo
-        like_url = cfg["like_url"]
-        asyncio.run(send_multiple_requests(uid, server_name, like_url, tokens))
-
-        # Step 4: After likes fetch
-        after = make_request(encrypted_uid, server_name, token)
-        if after is None:
-            return jsonify({"error": "Likes ke baad player info nahi mila.", "server": server_name}), 500
-
-        data_after   = json.loads(MessageToJson(after))
-        account_info = data_after.get('AccountInfo', {})
-        after_like   = int(account_info.get('Likes', 0) or 0)
-        player_uid   = int(account_info.get('UID', 0) or 0)
-        player_name  = str(account_info.get('PlayerNickname', ''))
-        like_given   = after_like - before_like
-
-        return jsonify({
-            "Developer":        "Rolex ❤️‍🔥",
-            "LikesGivenByAPI":  like_given,
-            "LikesafterCommand": after_like,
-            "LikesbeforeCommand": before_like,
-            "PlayerNickname":   player_name,
-            "Region":           server_name,
-            "UID":              player_uid,
-            "TokensUsed":       len(tokens),
-            "TokenFile":        cfg["token_file"],
-            "status":           1 if like_given > 0 else 2
-        })
-
-    except Exception as e:
-        app.logger.error(f"[LIKE][{server_name}] Route error: {e}")
-        return jsonify({"error": str(e), "server": server_name}), 500
-
-
-# ============================================================
-
-if __name__ == '__main__':
-    app.run(debug=True, use_reloader=False)
+               .
