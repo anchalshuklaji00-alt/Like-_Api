@@ -13,6 +13,8 @@ import uid_generator_pb2
 from google.protobuf.message import DecodeError
 import base64
 import time
+from proto import FreeFire_pb2
+from google.protobuf import json_format
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
 warnings.filterwarnings("ignore", category=InsecureRequestWarning)
@@ -24,6 +26,8 @@ app = Flask(__name__)
 # ============================================================
 RELEASE_VERSION = "OB54"
 USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 13; CPH2095 Build/RKQ1.211119.001)"
+MAIN_KEY = base64.b64decode('WWcmdGMlREV1aDYlWmNeOA==')
+MAIN_IV  = base64.b64decode('Nm95WkRyMjJFM3ljaGpNJQ==')
 
 # ============================================================
 # SERVER CONFIG — har server ka alag uidpass + token file
@@ -89,17 +93,22 @@ TOKEN_LAST_UPDATED = {s: 0 for s in SERVER_CONFIG}
 # TOKEN GENERATOR — per server
 # ============================================================
 
-def fetch_access_token_sync(uid, password):
-    url = f"https://ff-ob54-jwt-api.vercel.app/guest_to_jwt?uid={uid}&password={password}"
-    try:
-        resp = requests.get(url, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-        token = data.get("jwt_token") or data.get("access_token")
-        return token
-    except Exception as e:
-        app.logger.error(f"[TOKEN] JWT fetch error for uid={uid}: {e}")
-        return None
+def fetch_access_token_sync(cred_str):
+    url = "https://ffmconnect.live.gop.garenanow.com/oauth/guest/token/grant"
+    payload = (
+        cred_str
+        + "&response_type=token"
+        + "&client_type=2"
+        + "&client_secret=2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3"
+        + "&client_id=100067"
+    )
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+    resp = requests.post(url, data=payload, headers=headers, verify=False, timeout=15)
+    data = resp.json()
+    return data.get("access_token", ""), data.get("open_id", "")
 
 
 def update_tokens(server: str):
@@ -139,13 +148,54 @@ def update_tokens(server: str):
         uid_val  = acc.get("uid", "?")
         pass_val = acc.get("password", "?")
         try:
-            token = fetch_access_token_sync(uid_val, pass_val)
+            cred_str = f"uid={uid_val}&password={pass_val}"
+            access_token, open_id = fetch_access_token_sync(cred_str)
+
+            if not access_token:
+                app.logger.warning(f"[TOKEN][{server}] ❌ No access_token → uid={uid_val}")
+                failed_accs.append({"uid": uid_val, "password": pass_val, "reason": "No access_token"})
+                continue
+
+            login_req = FreeFire_pb2.LoginReq()
+            json_format.ParseDict({
+                "open_id":            open_id,
+                "open_id_type":       "4",
+                "login_token":        access_token,
+                "orign_platform_type": "4"
+            }, login_req)
+            proto_bytes = login_req.SerializeToString()
+
+            cipher  = AES.new(MAIN_KEY, AES.MODE_CBC, MAIN_IV)
+            pad_len = AES.block_size - (len(proto_bytes) % AES.block_size)
+            padded  = proto_bytes + bytes([pad_len] * pad_len)
+            encrypted = cipher.encrypt(padded)
+
+            url_login = "https://loginbp.ggblueshark.com/MajorLogin"
+            headers   = {
+                "User-Agent":      USER_AGENT,
+                "Content-Type":    "application/octet-stream",
+                "X-Unity-Version": "2018.4.11f1",
+                "X-GA":            "v1 1",
+                "ReleaseVersion":  RELEASE_VERSION
+            }
+            resp = requests.post(url_login, data=encrypted, headers=headers, verify=False, timeout=15)
+
+            if resp.status_code != 200:
+                reason = f"MajorLogin HTTP {resp.status_code}"
+                app.logger.error(f"[TOKEN][{server}] ❌ {reason} → uid={uid_val}")
+                failed_accs.append({"uid": uid_val, "password": pass_val, "reason": reason})
+                continue
+
+            login_res = FreeFire_pb2.LoginRes()
+            login_res.ParseFromString(resp.content)
+            msg   = json.loads(json_format.MessageToJson(login_res))
+            token = msg.get("token")
 
             if token:
                 new_tokens.append({"token": token})
                 app.logger.info(f"[TOKEN][{server}] ✅ uid={uid_val}")
             else:
-                reason = "No token from JWT API"
+                reason = "Empty token from MajorLogin"
                 app.logger.warning(f"[TOKEN][{server}] ❌ {reason} → uid={uid_val}")
                 failed_accs.append({"uid": uid_val, "password": pass_val, "reason": reason})
 
@@ -523,74 +573,4 @@ def delete_account():
     URL: /delete?uid=12345&server=IND
     """
     uid_val = request.args.get("uid", "").strip()
-    server  = request.args.get("server", "").upper().strip()
-
-    if not uid_val:
-        return jsonify({"error": "❌ 'uid' parameter missing hai."}), 400
-    if not server:
-        return jsonify({"error": "❌ 'server' parameter missing hai."}), 400
-    if server not in SERVER_CONFIG:
-        return jsonify({
-            "error":         f"❌ Unknown server '{server}'.",
-            "valid_servers": list(SERVER_CONFIG.keys())
-        }), 400
-
-    uidpass_file = SERVER_CONFIG[server]["uidpass_file"]
-
-    try:
-        with open(uidpass_file, "r") as f:
-            accounts = json.load(f)
-        if not isinstance(accounts, list):
-            accounts = []
-    except FileNotFoundError:
-        return jsonify({"error": f"❌ File '{uidpass_file}' exist nahi karta."}), 404
-    except Exception as e:
-        return jsonify({"error": f"❌ File read error: {e}"}), 500
-
-    before_count = len(accounts)
-    accounts = [a for a in accounts if str(a.get("uid", "")) != str(uid_val)]
-    after_count  = len(accounts)
-
-    if before_count == after_count:
-        return jsonify({
-            "status":  "not_found",
-            "message": f"⚠️ UID {uid_val} '{uidpass_file}' me nahi mila.",
-            "server":  server,
-            "uid":     uid_val
-        }), 404
-
-    try:
-        with open(uidpass_file, "w") as f:
-            json.dump(accounts, f, indent=4)
-    except Exception as e:
-        return jsonify({"error": f"❌ File save error: {e}"}), 500
-
-    app.logger.info(f"[DELETE][{server}] 🗑️ uid={uid_val} removed from {uidpass_file}")
-
-    return jsonify({
-        "status":         "deleted",
-        "message":        f"🗑️ UID {uid_val} '{uidpass_file}' se remove ho gaya.",
-        "server":         server,
-        "uid":            uid_val,
-        "total_accounts": after_count
-    }), 200
-
-
-# ─── LIST ACCOUNTS ROUTE ───
-
-@app.route('/accounts', methods=['GET'])
-def list_accounts():
-    """
-    Kisi server ke saved accounts dekho.
-    URL: /accounts?server=IND
-    """
-    server = request.args.get("server", "").upper().strip()
-
-    if not server:
-        # Sare servers ka summary
-        summary = {}
-        for srv, cfg in SERVER_CONFIG.items():
-            try:
-                with open(cfg["uidpass_file"], "r") as f:
-                    accs = json.load(f)
-               .
+    server  = request.args.get("server
