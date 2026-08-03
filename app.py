@@ -19,6 +19,14 @@ import warnings
 from urllib3.exceptions import InsecureRequestWarning
 warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
+# ── SOCKS5 support for aiohttp ──
+try:
+    from aiohttp_socks import ProxyConnector
+    SOCKS_OK = True
+except ImportError:
+    ProxyConnector = None
+    SOCKS_OK = False
+
 app = Flask(__name__)
 
 # ============================================================
@@ -28,6 +36,46 @@ RELEASE_VERSION = "OB54"
 USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 13; CPH2095 Build/RKQ1.211119.001)"
 MAIN_KEY = base64.b64decode('WWcmdGMlREV1aDYlWmNeOA==')
 MAIN_IV  = base64.b64decode('Nm95WkRyMjJFM3ljaGpNJQ==')
+
+# ============================================================
+# 🔥 PROXY CONFIG (SOCKS5 — IP Rotating, 5 MIN cycle)
+# ============================================================
+PROXY_HOST = "change5.owlproxy.com"
+PROXY_PORT = 7778
+PROXY_USER = "9BGwD8xXLz40_custom_zone_AE_st__city_sid_52482655_time_5"
+PROXY_PASS = "5215844"
+
+PROXY_URL = f"socks5://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
+
+# Kaha kaha proxy use karna hai
+USE_PROXY_FOR_LIKE  = True    # ← LikeProfile requests proxy se jayengi
+USE_PROXY_FOR_INFO  = False   # ← Player info (before/after likes). True karoge to ye bhi proxy se
+USE_PROXY_FOR_TOKEN = False   # ← Token/login generation (recommended: False)
+
+# requests library ke liye proxy dict
+REQ_PROXIES = {
+    "http":  PROXY_URL,
+    "https": PROXY_URL,
+}
+
+
+def _req_proxy(enabled: bool):
+    """requests ke liye proxies dict return karo (ya None)."""
+    return REQ_PROXIES if enabled else None
+
+
+def _make_connector():
+    """aiohttp ke liye SOCKS5 connector banao."""
+    if USE_PROXY_FOR_LIKE and SOCKS_OK:
+        try:
+            return ProxyConnector.from_url(PROXY_URL, rdns=True, limit=0, ssl=False)
+        except Exception as e:
+            app.logger.error(f"[PROXY] Connector banane me error: {e} — direct connection use hoga")
+            return None
+    if USE_PROXY_FOR_LIKE and not SOCKS_OK:
+        app.logger.warning("[PROXY] aiohttp_socks install nahi hai → 'pip install aiohttp_socks'")
+    return None
+
 
 # ============================================================
 # SERVER CONFIG — har server ka alag uidpass + token file
@@ -57,7 +105,6 @@ SERVER_CONFIG = {
         "like_url":     "https://clientbp.ggpolarbear.com/LikeProfile",
         "info_url":     "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow",
     },
-    # US / BR / NA / SAC ke liye bhi IND jaise add kar sakte ho
     "BR":  {
         "uidpass_file": "uidpass_br.json",
         "token_file":   "token_br.txt",
@@ -65,7 +112,7 @@ SERVER_CONFIG = {
         "info_url":     "https://client.us.freefiremobile.com/GetPlayerPersonalShow",
     },
     "US":  {
-        "uidpass_file": "uidpass_br.json",   # same as BR
+        "uidpass_file": "uidpass_br.json",
         "token_file":   "token_br.txt",
         "like_url":     "https://client.us.freefiremobile.com/LikeProfile",
         "info_url":     "https://client.us.freefiremobile.com/GetPlayerPersonalShow",
@@ -84,7 +131,6 @@ SERVER_CONFIG = {
     },
 }
 
-# Per-server in-memory token cache
 MEMORY_TOKENS = {s: [] for s in SERVER_CONFIG}
 TOKEN_LAST_UPDATED = {s: 0 for s in SERVER_CONFIG}
 
@@ -106,17 +152,15 @@ def fetch_access_token_sync(cred_str):
         "User-Agent": USER_AGENT,
         "Content-Type": "application/x-www-form-urlencoded"
     }
-    resp = requests.post(url, data=payload, headers=headers, verify=False, timeout=15)
+    resp = requests.post(
+        url, data=payload, headers=headers, verify=False, timeout=15,
+        proxies=_req_proxy(USE_PROXY_FOR_TOKEN)
+    )
     data = resp.json()
     return data.get("access_token", ""), data.get("open_id", "")
 
 
 def update_tokens(server: str):
-    """
-    Ek specific server ke uidpass file se tokens generate karo.
-    Return: (success_count, failed_count, failed_accounts_list)
-    failed_accounts_list = [{"uid": ..., "password": ...}, ...]
-    """
     global MEMORY_TOKENS, TOKEN_LAST_UPDATED
 
     server = server.upper()
@@ -139,7 +183,7 @@ def update_tokens(server: str):
         return 0, 0, []
 
     new_tokens    = []
-    failed_accs   = []   # ← failed uid+pass yahan store honge
+    failed_accs   = []
     total         = len(accounts)
 
     app.logger.info(f"[TOKEN][{server}] Total accounts: {total} — generating tokens...")
@@ -178,7 +222,10 @@ def update_tokens(server: str):
                 "X-GA":            "v1 1",
                 "ReleaseVersion":  RELEASE_VERSION
             }
-            resp = requests.post(url_login, data=encrypted, headers=headers, verify=False, timeout=15)
+            resp = requests.post(
+                url_login, data=encrypted, headers=headers, verify=False, timeout=15,
+                proxies=_req_proxy(USE_PROXY_FOR_TOKEN)
+            )
 
             if resp.status_code != 200:
                 reason = f"MajorLogin HTTP {resp.status_code}"
@@ -224,7 +271,6 @@ def update_tokens(server: str):
 
 
 def load_tokens(server: str):
-    """Server ka token_file ya MEMORY_TOKENS se tokens load karo."""
     server = server.upper()
     if server not in SERVER_CONFIG:
         return []
@@ -245,12 +291,6 @@ def load_tokens(server: str):
 
 
 def get_tokens_with_auto_refresh(server: str):
-    """
-    Smart loader:
-    - Khali → generate karo
-    - 7 ghante se purane → refresh karo
-    - Valid → return karo
-    """
     server = server.upper()
     tokens = load_tokens(server)
 
@@ -309,10 +349,10 @@ def enc(uid):
 
 
 # ============================================================
-# LIKE SENDING
+# LIKE SENDING  (🔥 PROXY YAHAN LAGA HAI)
 # ============================================================
 
-async def send_request(encrypted_uid, token, url):
+async def send_request(encrypted_uid, token, url, session):
     try:
         edata = bytes.fromhex(encrypted_uid)
         headers = {
@@ -326,12 +366,11 @@ async def send_request(encrypted_uid, token, url):
             'X-GA':            "v1 1",
             'ReleaseVersion':  RELEASE_VERSION
         }
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, data=edata, headers=headers) as response:
-                if response.status != 200:
-                    return response.status
-                return await response.text()
-    except:
+        async with session.post(url, data=edata, headers=headers, ssl=False) as response:
+            if response.status != 200:
+                return response.status
+            return await response.text()
+    except Exception as e:
         return None
 
 
@@ -345,13 +384,23 @@ async def send_multiple_requests(uid, server_name, url, tokens):
         if encrypted_uid is None:
             return None
 
-        tasks = []
-        for i in range(100):
-            token = tokens[i % len(tokens)]["token"]
-            tasks.append(send_request(encrypted_uid, token, url))
+        connector = _make_connector()          # ← SOCKS5 proxy connector
+        timeout   = aiohttp.ClientTimeout(total=40, connect=20)
 
-        return await asyncio.gather(*tasks, return_exceptions=True)
-    except:
+        if connector:
+            app.logger.info(f"[PROXY] Likes ja rahi hain via SOCKS5 → {PROXY_HOST}:{PROXY_PORT}")
+        else:
+            app.logger.info("[PROXY] Direct connection (proxy off / unavailable)")
+
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            tasks = []
+            for i in range(100):
+                token = tokens[i % len(tokens)]["token"]
+                tasks.append(send_request(encrypted_uid, token, url, session))
+
+            return await asyncio.gather(*tasks, return_exceptions=True)
+    except Exception as e:
+        app.logger.error(f"[LIKE] send_multiple_requests error: {e}")
         return None
 
 
@@ -379,7 +428,10 @@ def make_request(encrypt, server_name, token):
             'X-GA':            "v1 1",
             'ReleaseVersion':  RELEASE_VERSION
         }
-        response = requests.post(url, data=edata, headers=headers, verify=False, timeout=15)
+        response = requests.post(
+            url, data=edata, headers=headers, verify=False, timeout=20,
+            proxies=_req_proxy(USE_PROXY_FOR_INFO)
+        )
         if response.status_code != 200:
             return None
 
@@ -418,6 +470,15 @@ def index():
         "Developer":        "Rolex",
         "status":           "Online",
         "version":          RELEASE_VERSION,
+        "proxy": {
+            "enabled_for_like": USE_PROXY_FOR_LIKE,
+            "enabled_for_info": USE_PROXY_FOR_INFO,
+            "host":             f"{PROXY_HOST}:{PROXY_PORT}",
+            "type":             "SOCKS5",
+            "rotation":         "5 minutes",
+            "socks_lib_ok":     SOCKS_OK,
+            "check_url":        "/proxy_check"
+        },
         "servers":          server_status,
         "like_endpoint":    "/like?uid=<uid>&server_name=IND",
         "refresh_endpoints": {
@@ -430,22 +491,42 @@ def index():
     })
 
 
+# ─── PROXY CHECK ───
+
+@app.route('/proxy_check', methods=['GET'])
+def proxy_check():
+    """Proxy chal raha hai ya nahi — current IP dekho. 5 min baad dobara hit karo, IP badal jayegi."""
+    result = {"proxy": f"{PROXY_HOST}:{PROXY_PORT}", "type": "SOCKS5", "rotation": "5 minutes"}
+    try:
+        direct = requests.get("https://api.ipify.org?format=json", timeout=15).json()
+        result["direct_ip"] = direct.get("ip")
+    except Exception as e:
+        result["direct_ip"] = f"error: {e}"
+    try:
+        via = requests.get("https://api.ipify.org?format=json",
+                           proxies=REQ_PROXIES, timeout=25).json()
+        result["proxy_ip"] = via.get("ip")
+        result["status"]   = "✅ Proxy working"
+    except Exception as e:
+        result["proxy_ip"] = None
+        result["status"]   = f"❌ Proxy failed: {e}"
+    return jsonify(result)
+
+
 # ─── CRON: specific server refresh ───
 
 def _run_cron_for_server(server: str):
-    """Helper — ek server refresh karo aur response dict banao."""
     server = server.upper()
     if server not in SERVER_CONFIG:
         return {"error": f"Unknown server: {server}"}, 400
 
     success, failed, failed_accs = update_tokens(server)
 
-    # failed_accs me uid+pass+reason hai — response me daal do
     return {
         "server":            server,
         "tokens_generated":  success,
         "tokens_failed":     failed,
-        "failed_accounts":   failed_accs,   # ← uid, password, reason
+        "failed_accounts":   failed_accs,
         "version":           RELEASE_VERSION,
         "status":            200 if success > 0 else 500,
         "message":           (
@@ -457,7 +538,6 @@ def _run_cron_for_server(server: str):
 
 @app.route('/cron', methods=['GET'])
 def trigger_cron_all():
-    """Sare servers refresh karo."""
     results = {}
     overall_ok = False
     for srv in SERVER_CONFIG:
@@ -500,15 +580,10 @@ def trigger_cron_har():
 
 @app.route('/save', methods=['GET'])
 def save_account():
-    """
-    Server ki uidpass file me naya account add karo.
-    URL: /save?uid=12345&password=xxxxx&server=IND
-    """
     uid_val  = request.args.get("uid", "").strip()
     pass_val = request.args.get("password", "").strip()
     server   = request.args.get("server", "").upper().strip()
 
-    # ── Validation ──
     if not uid_val:
         return jsonify({"error": "❌ 'uid' parameter missing hai."}), 400
     if not pass_val:
@@ -523,18 +598,16 @@ def save_account():
 
     uidpass_file = SERVER_CONFIG[server]["uidpass_file"]
 
-    # ── File load karo (ya naya banao) ──
     try:
         with open(uidpass_file, "r") as f:
             accounts = json.load(f)
         if not isinstance(accounts, list):
             accounts = []
     except FileNotFoundError:
-        accounts = []   # file nahi thi — naya banayenge
+        accounts = []
     except Exception as e:
         return jsonify({"error": f"❌ File read error: {e}"}), 500
 
-    # ── Duplicate check ──
     for acc in accounts:
         if str(acc.get("uid", "")) == str(uid_val):
             return jsonify({
@@ -544,7 +617,6 @@ def save_account():
                 "uid":     uid_val
             }), 200
 
-    # ── Append + Save ──
     accounts.append({"uid": uid_val, "password": pass_val})
     try:
         with open(uidpass_file, "w") as f:
@@ -568,10 +640,6 @@ def save_account():
 
 @app.route('/delete', methods=['GET'])
 def delete_account():
-    """
-    Server ki uidpass file se koi UID remove karo.
-    URL: /delete?uid=12345&server=IND
-    """
     uid_val = request.args.get("uid", "").strip()
     server  = request.args.get("server", "").upper().strip()
 
@@ -630,14 +698,9 @@ def delete_account():
 
 @app.route('/accounts', methods=['GET'])
 def list_accounts():
-    """
-    Kisi server ke saved accounts dekho.
-    URL: /accounts?server=IND
-    """
     server = request.args.get("server", "").upper().strip()
 
     if not server:
-        # Sare servers ka summary
         summary = {}
         for srv, cfg in SERVER_CONFIG.items():
             try:
@@ -683,17 +746,11 @@ def list_accounts():
 
 @app.route('/status', methods=['GET'])
 def server_status():
-    """
-    Har server me kitne IDs aur kitne Tokens hain — full details ke saath.
-    URL: /status          → sare servers ka status
-    URL: /status?server=IND → sirf ek server ka status
-    """
     server_param = request.args.get("server", "").upper().strip()
 
     def get_server_detail(srv):
         cfg = SERVER_CONFIG[srv]
 
-        # ── IDs count from uidpass file ──
         try:
             with open(cfg["uidpass_file"], "r") as f:
                 accounts = json.load(f)
@@ -711,7 +768,6 @@ def server_status():
             total_ids  = 0
             ids_status = f"❌ Error: {e}"
 
-        # ── Tokens count from memory / token file ──
         mem_tokens = MEMORY_TOKENS.get(srv, [])
         if mem_tokens:
             token_source = "memory (RAM)"
@@ -732,7 +788,6 @@ def server_status():
 
         total_tokens = len(tokens_list)
 
-        # ── Token age ──
         last_updated = TOKEN_LAST_UPDATED.get(srv, 0)
         if last_updated:
             age_seconds = round(time.time() - last_updated)
@@ -757,7 +812,6 @@ def server_status():
             "summary":       f"📋 IDs: {total_ids} | 🔑 Tokens: {total_tokens}"
         }
 
-    # ── Single server ──
     if server_param:
         if server_param not in SERVER_CONFIG:
             return jsonify({
@@ -767,7 +821,6 @@ def server_status():
         detail = get_server_detail(server_param)
         return jsonify(detail), 200
 
-    # ── All servers ──
     all_status   = {}
     total_ids_all    = 0
     total_tokens_all = 0
@@ -780,6 +833,7 @@ def server_status():
 
     return jsonify({
         "Developer":       "Rolex ❤️‍🔥",
+        "proxy":           f"SOCKS5 {PROXY_HOST}:{PROXY_PORT} (5min rotation) | like={USE_PROXY_FOR_LIKE} info={USE_PROXY_FOR_INFO}",
         "overall_summary": f"📋 Total IDs (all servers): {total_ids_all} | 🔑 Total Tokens (all servers): {total_tokens_all}",
         "total_ids_all_servers":    total_ids_all,
         "total_tokens_all_servers": total_tokens_all,
@@ -797,7 +851,6 @@ def handle_requests():
 
     server_name = request.args.get("server_name", "IND").upper()
 
-    # Server valid hai?
     if server_name not in SERVER_CONFIG:
         return jsonify({
             "error": f"Unknown server '{server_name}'. Valid: {list(SERVER_CONFIG.keys())}"
@@ -806,11 +859,9 @@ def handle_requests():
     cfg = SERVER_CONFIG[server_name]
 
     try:
-        # Step 1: Server ke tokens lo
         tokens = get_tokens_with_auto_refresh(server_name)
 
         if not tokens:
-            # Token file exist nahi ya khali — server ke liye like nahi ja sakta
             return jsonify({
                 "error":   f"❌ {server_name} server me like nahi ja sakta.",
                 "reason":  f"'{cfg['token_file']}' me koi token nahi hai.",
@@ -823,11 +874,9 @@ def handle_requests():
         if not encrypted_uid:
             return jsonify({"error": "Encryption failed."}), 500
 
-        # Step 2: Before likes fetch
         token = tokens[0]['token']
         before = make_request(encrypted_uid, server_name, token)
 
-        # Token expire hua → force refresh + retry
         if before is None:
             app.logger.warning(f"[LIKE][{server_name}] Token expired — force refresh...")
             update_tokens(server_name)
@@ -851,11 +900,10 @@ def handle_requests():
         data_before = json.loads(MessageToJson(before))
         before_like = int(data_before.get('AccountInfo', {}).get('Likes', 0) or 0)
 
-        # Step 3: Likes bhejo — server ka like_url use karo
+        # 🔥 Likes proxy ke through jayengi
         like_url = cfg["like_url"]
         asyncio.run(send_multiple_requests(uid, server_name, like_url, tokens))
 
-        # Step 4: After likes fetch
         after = make_request(encrypted_uid, server_name, token)
         if after is None:
             return jsonify({"error": "Likes ke baad player info nahi mila.", "server": server_name}), 500
@@ -877,6 +925,7 @@ def handle_requests():
             "UID":              player_uid,
             "TokensUsed":       len(tokens),
             "TokenFile":        cfg["token_file"],
+            "ProxyUsed":        f"SOCKS5 {PROXY_HOST}:{PROXY_PORT} (5min rotation)" if (USE_PROXY_FOR_LIKE and SOCKS_OK) else "Direct",
             "status":           1 if like_given > 0 else 2
         })
 
